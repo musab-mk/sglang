@@ -293,6 +293,17 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+
+class ChoiceDeltaToolCall(BaseModel):
+    index: Optional[int] = None
+    id: Optional[str] = None
+    type: Optional[str] = None
+    function: Optional[Dict[str, Any]] = None
+
+class ChoiceDeltaToolCallFunction(BaseModel):
+    name: Optional[str] = None
+    arguments: Optional[str] = None
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):

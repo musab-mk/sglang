@@ -53,6 +53,8 @@ from sglang.srt.openai_api.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     DeltaMessage,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
     EmbeddingObject,
     EmbeddingRequest,
     EmbeddingResponse,
@@ -868,7 +870,7 @@ def v1_chat_generate_response(request, ret, to_file=False):
         else:
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
-                message=ChatMessage(role="assistant", content=text_content, tool_calls=tool_calls,
+                message=ChatMessage(role="assistant", content=text_content, tool_calls=tool_calls),
                 logprobs=choice_logprobs,
                 finish_reason=format_finish_reason(
                     ret_item["meta_info"]["finish_reason"]
@@ -929,9 +931,11 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
         async def generate_stream_resp():
             is_first = True
-
             stream_buffer = ""
             n_prev_token = 0
+            current_tool_call = None
+            text_content = ""
+
             try:
                 async for content in tokenizer_manager.generate_request(
                     adapted_request, raw_request
@@ -979,19 +983,57 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                             )
 
                         choice_logprobs = ChoiceLogprobs(content=token_logprobs)
-
                     else:
                         choice_logprobs = None
 
+                    text = content["text"]
+                    delta = text[len(stream_buffer):]
+                    stream_buffer = stream_buffer + delta
+
+                    # Parse the response for tool support
+                    if ">>>" in delta:
+                        chunks = delta.split(">>>")
+                        for chunk in chunks:
+                            chunk = chunk.strip()
+                            if chunk:
+                                index = chunk.find("\n")
+                                if index != -1:
+                                    func_name = chunk[:index].strip()
+                                    arguments = chunk[index + 1:].strip()
+                                    if func_name == "all":
+                                        text_content += arguments
+                                    else:
+                                        if current_tool_call is None:
+                                            current_tool_call = {
+                                                "function": {"name": func_name, "arguments": ""},
+                                                "id": "".join(random.choices("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", k=29)),
+                                                "type": "function",
+                                            }
+                                        current_tool_call["function"]["arguments"] += arguments
+                    else:
+                        if current_tool_call:
+                            current_tool_call["function"]["arguments"] += delta
+                        else:
+                            text_content += delta
+
                     if is_first:
-                        # First chunk with role
+                        # First chunk with role and tool call initialization
                         is_first = False
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=0,
-                            delta=DeltaMessage(role="assistant"),
-                            finish_reason=format_finish_reason(
-                                content["meta_info"]["finish_reason"]
+                            delta=DeltaMessage(
+                                role="assistant",
+                                tool_calls=[ChoiceDeltaToolCall(
+                                    index=0,
+                                    id=current_tool_call["id"] if current_tool_call else None,
+                                    function=ChoiceDeltaToolCallFunction(
+                                        name=current_tool_call["function"]["name"] if current_tool_call else None,
+                                        arguments=""
+                                    ),
+                                    type="function" if current_tool_call else None
+                                )] if current_tool_call else None
                             ),
+                            finish_reason=None,
                             logprobs=choice_logprobs,
                         )
                         chunk = ChatCompletionStreamResponse(
@@ -1001,23 +1043,60 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-                    text = content["text"]
-                    delta = text[len(stream_buffer) :]
-                    stream_buffer = stream_buffer + delta
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=0,
-                        delta=DeltaMessage(content=delta),
-                        finish_reason=format_finish_reason(
-                            content["meta_info"]["finish_reason"]
-                        ),
-                        logprobs=choice_logprobs,
-                    )
-                    chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        choices=[choice_data],
-                        model=request.model,
-                    )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    # Send content delta or tool call delta
+                    if text_content:
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=0,
+                            delta=DeltaMessage(content=text_content),
+                            finish_reason=None,
+                            logprobs=choice_logprobs,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        text_content = ""
+                    elif current_tool_call:
+                        choice_data = ChatCompletionResponseStreamChoice(
+                            index=0,
+                            delta=DeltaMessage(
+                                tool_calls=[ChoiceDeltaToolCall(
+                                    index=0,
+                                    id=None,
+                                    function=ChoiceDeltaToolCallFunction(
+                                        name=None,
+                                        arguments=current_tool_call["function"]["arguments"]
+                                    ),
+                                    type=None
+                                )]
+                            ),
+                            finish_reason=None,
+                            logprobs=choice_logprobs,
+                        )
+                        chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            choices=[choice_data],
+                            model=request.model,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        current_tool_call["function"]["arguments"] = ""
+
+                # Send final chunk with finish_reason
+                final_choice_data = ChatCompletionResponseStreamChoice(
+                    index=0,
+                    delta=DeltaMessage(),
+                    finish_reason="tool_calls" if current_tool_call else "stop",
+                    logprobs=None,
+                )
+                final_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    choices=[final_choice_data],
+                    model=request.model,
+                )
+                yield f"data: {final_chunk.model_dump_json()}\n\n"
+
                 if request.stream_options and request.stream_options.include_usage:
                     usage = UsageInfo(
                         prompt_tokens=prompt_tokens,
@@ -1039,6 +1118,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                 error = create_streaming_error_response(str(e))
                 yield f"data: {error}\n\n"
             yield "data: [DONE]\n\n"
+
 
         return StreamingResponse(
             generate_stream_resp(),
